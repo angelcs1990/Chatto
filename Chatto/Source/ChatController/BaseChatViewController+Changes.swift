@@ -42,8 +42,6 @@ private struct HashableItem: Hashable {
 extension BaseChatViewController {
 
     public func enqueueModelUpdate(updateType: UpdateType, completion: (() -> Void)? = nil) {
-        let newItems = self.chatDataSource?.chatItems ?? []
-
         if self.updatesConfig.coalesceUpdates {
             self.updateQueue.flushQueue()
         }
@@ -52,6 +50,7 @@ extension BaseChatViewController {
             guard let sSelf = self else { return }
 
             let oldItems = sSelf.chatItemCompanionCollection
+            let newItems = sSelf.chatDataSource?.chatItems ?? []
             sSelf.updateModels(newItems: newItems, oldItems: oldItems, updateType: updateType, completion: {
                 guard let sSelf = self else { return }
                 if sSelf.updateQueue.isEmpty {
@@ -104,8 +103,10 @@ extension BaseChatViewController {
 
     func updateVisibleCells(_ changes: CollectionChanges) {
         // Datasource should be already updated!
-
-        assert(self.visibleCellsAreValid(changes: changes), "Invalid visible cells. Don't call me")
+        if self.visibleCellsAreValid(changes: changes) == false {
+            return
+        }
+//        assert(self.visibleCellsAreValid(changes: changes), "Invalid visible cells. Don't call me")
 
         let cellsToUpdate = updated(collection: self.visibleCellsFromCollectionViewApi(), withChanges: changes)
         self.visibleCells = cellsToUpdate
@@ -148,6 +149,7 @@ extension BaseChatViewController {
     func performBatchUpdates(updateModelClosure: @escaping () -> Void, // swiftlint:disable:this cyclomatic_complexity
                              changes: CollectionChanges,
                              updateType: UpdateType,
+                             areCollectionChangesConsistent: Bool,
                              completion: @escaping () -> Void) {
         guard let collectionView = self.collectionView else {
             completion()
@@ -162,19 +164,23 @@ extension BaseChatViewController {
             // a) It's unsafe to perform reloadData while there's a performBatchUpdates animating: https://github.com/diegosanchezr/UICollectionViewStressing/tree/master/GhostCells
             // Note: using reloadSections instead reloadData is safe and might not need a delay. However, using always reloadSections causes flickering on pagination and a crash on the first layout that needs a workaround. Let's stick to reloaData for now
             // b) If it's a performBatchUpdates but visible cells are invalid let's wait until all finish (otherwise we would give wrong cells to presenters in updateVisibleCells)
-            let mustDelayUpdate = hasUnfinishedBatchUpdates && (wantsReloadData || !visibleCellsAreValid)
+            let mustDelayUpdate = hasUnfinishedBatchUpdates && (!areCollectionChangesConsistent || wantsReloadData || !visibleCellsAreValid)
             guard !mustDelayUpdate else {
                 // For reference, it is possible to force the current performBatchUpdates to finish in the next run loop, by cancelling animations:
                 // self.collectionView.subviews.forEach { $0.layer.removeAllAnimations() }
                 self.onAllBatchUpdatesFinished = { [weak self] in
                     self?.onAllBatchUpdatesFinished = nil
-                    self?.performBatchUpdates(updateModelClosure: updateModelClosure, changes: changes, updateType: updateType, completion: completion)
+                    self?.performBatchUpdates(updateModelClosure: updateModelClosure, changes: changes, updateType: updateType, areCollectionChangesConsistent: areCollectionChangesConsistent, completion: completion)
                 }
                 return
             }
             // ... if they are still invalid the only thing we can do is a reloadData
             let mustDoReloadData = !visibleCellsAreValid // Only way to recover from this inconsistent state
-            usesBatchUpdates = !wantsReloadData && !mustDoReloadData
+            usesBatchUpdates = !wantsReloadData && !mustDoReloadData && areCollectionChangesConsistent
+            
+            if !wantsReloadData && !mustDoReloadData && !areCollectionChangesConsistent {
+                assertionFailure("Collection changes are invalid.")
+            }
         }
 
         let scrollAction: ScrollAction
@@ -255,11 +261,12 @@ extension BaseChatViewController {
         let performInBackground = updateType != .firstLoad
 
         self.autoLoadingEnabled = false
-        let perfomBatchUpdates: (_ changes: CollectionChanges, _ updateModelClosure: @escaping () -> Void) -> Void  = { [weak self] (changes, updateModelClosure) in
+        let perfomBatchUpdates: (_ changes: CollectionChanges, _ updateModelClosure: @escaping () -> Void, Bool) -> Void  = { [weak self] (changes, updateModelClosure, areCollectionChangesConsistent) in
             self?.performBatchUpdates(
                 updateModelClosure: updateModelClosure,
                 changes: changes,
                 updateType: updateType,
+                areCollectionChangesConsistent: areCollectionChangesConsistent,
                 completion: { () -> Void in
                     self?.autoLoadingEnabled = true
                     completion()
@@ -277,16 +284,16 @@ extension BaseChatViewController {
             DispatchQueue.global(qos: .userInitiated).async { () -> Void in
                 let modelUpdate = createModelUpdate()
                 DispatchQueue.main.async(execute: { () -> Void in
-                    perfomBatchUpdates(modelUpdate.changes, modelUpdate.updateModelClosure)
+                    perfomBatchUpdates(modelUpdate.changes, modelUpdate.updateModelClosure, modelUpdate.areChangesConsistent)
                 })
             }
         } else {
             let modelUpdate = createModelUpdate()
-            perfomBatchUpdates(modelUpdate.changes, modelUpdate.updateModelClosure)
+            perfomBatchUpdates(modelUpdate.changes, modelUpdate.updateModelClosure, modelUpdate.areChangesConsistent)
         }
     }
 
-    private func createModelUpdates(newItems: [ChatItemProtocol], oldItems: ChatItemCompanionCollection, collectionViewWidth: CGFloat) -> (changes: CollectionChanges, updateModelClosure: () -> Void) {
+    private func createModelUpdates(newItems: [ChatItemProtocol], oldItems: ChatItemCompanionCollection, collectionViewWidth: CGFloat) -> (changes: CollectionChanges, updateModelClosure: () -> Void, areChangesConsistent: Bool) {
         let newDecoratedItems = self.chatItemsDecorator?.decorateItems(newItems) ?? newItems.map { DecoratedChatItem(chatItem: $0, decorationAttributes: nil) }
         let changes = Chatto.generateChanges(oldCollection: oldItems.map(HashableItem.init),
                                              newCollection: newDecoratedItems.map(HashableItem.init))
@@ -296,7 +303,25 @@ extension BaseChatViewController {
             self?.layoutModel = layoutModel
             self?.chatItemCompanionCollection = itemCompanionCollection
         }
-        return (changes, updateModelClosure)
+        let areCollectionChangesConsistent = Self.validateCollectionChangeModel(
+            changes,
+            oldItems: oldItems,
+            newItems: newDecoratedItems
+        )
+        return (changes, updateModelClosure, areCollectionChangesConsistent)
+    }
+    private static func validateCollectionChangeModel(
+        _ collection: CollectionChanges,
+        oldItems: ChatItemCompanionCollection,
+        newItems: [DecoratedChatItem]
+    ) -> Bool {
+        let deletionChangesCount = collection.deletedIndexPaths.count
+        let insertionChangesCount = collection.insertedIndexPaths.count
+
+        let oldItemsCount = oldItems.count
+        let newItemsCount = newItems.count
+
+        return (newItemsCount - oldItemsCount) == (insertionChangesCount - deletionChangesCount)
     }
 
     private func createCompanionCollection(fromChatItems newItems: [DecoratedChatItem], previousCompanionCollection oldItems: ChatItemCompanionCollection) -> ChatItemCompanionCollection {
