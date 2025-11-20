@@ -30,7 +30,8 @@ public enum CellVerticalEdge {
 }
 
 extension CGFloat {
-    static let bma_epsilon: CGFloat = 0.001
+//    static let bma_epsilon: CGFloat = 0.001
+    public static var bma_epsilon: CGFloat = 1
 }
 
 extension BaseChatViewController {
